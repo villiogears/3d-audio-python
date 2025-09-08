@@ -2,41 +2,92 @@ import pyaudio
 import numpy as np
 import time
 import sys
-import torch
+try:
+	import torch
+	TORCH_AVAILABLE = True
+except Exception:
+	torch = None
+	TORCH_AVAILABLE = False
 
-# Simple PyTorch binaural processor: apply interaural time difference (ITD)
-class BinauralProcessor:
+
+# Advanced PyTorch binaural processor with fractional delay (stateful)
+class AdvancedBinauralProcessor:
 	def __init__(self, rate=44100, max_delay_ms=2.0, device=None):
+		if not TORCH_AVAILABLE:
+			raise RuntimeError('PyTorch is not available')
 		self.rate = rate
-		self.max_delay = int(rate * max_delay_ms / 1000)
+		self.max_delay = int(rate * max_delay_ms / 1000)  # samples
 		self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+		self.prev = torch.zeros(self.max_delay + 2, dtype=torch.float32, device=self.device)
 
-	def apply_itd(self, audio_np, azimuth=0.0):
-		# audio_np: numpy array shape (n, 1) mono or (n,2) stereo
-		# We'll treat input as mono and create stereo with ITD
-		if audio_np.ndim == 2 and audio_np.shape[1] == 2:
-			mono = audio_np.mean(axis=1)
-		elif audio_np.ndim == 2 and audio_np.shape[1] == 1:
-			mono = audio_np[:, 0]
-		else:
-			mono = audio_np
+	def fractional_delay(self, x: torch.Tensor, delay: float) -> torch.Tensor:
+		# delay >= 0 (samples, may be fractional)
+		n = int(torch.floor(torch.tensor(delay)).item())
+		frac = delay - n
+		L = x.shape[0]
+		# Prepare padded signal using previous buffer
+		padded = torch.cat([self.prev, x])
+		start = self.prev.shape[0] - n - 1
+		if start < 0:
+			# pad more on the left
+			padded = torch.cat([torch.zeros(-start, device=self.device), padded])
+			start = 0
+		idx_a = start + torch.arange(0, L, device=self.device)
+		idx_b = idx_a + 1
+		a = padded[idx_a.long()]
+		b = padded[idx_b.long()]
+		y = (1.0 - frac) * a + frac * b
+		# update prev buffer for next chunk
+		tail_len = min(self.max_delay + 2, padded.shape[0])
+		self.prev = padded[-tail_len:].clone()
+		return y
 
-		x = torch.from_numpy(mono.astype(np.float32)).to(self.device)
-		# ITD: map azimuth (-1..1) to delay samples (-max_delay..max_delay)
-		delay = int(azimuth * self.max_delay)
-		if delay > 0:
-			# right delayed
+	def process(self, mono_np: np.ndarray, azimuth: float = 0.0) -> np.ndarray:
+		# mono_np: 1D numpy float32
+		x = torch.from_numpy(mono_np.astype(np.float32)).to(self.device)
+		# map azimuth (-1..1) to max_delay range
+		maxd = float(self.max_delay)
+		itd = azimuth * maxd  # signed float samples
+		# positive => right delayed
+		if itd >= 0:
 			left = x
-			right = torch.cat([torch.zeros(delay, device=self.device), x[:-delay]])
-		elif delay < 0:
-			d = -delay
-			left = torch.cat([torch.zeros(d, device=self.device), x[:-d]])
-			right = x
+			right = self.fractional_delay(x, itd)
 		else:
-			left = x
 			right = x
+			left = self.fractional_delay(x, -itd)
+
+		# IID: simple level difference based on azimuth
+		left_gain = 1.0 - 0.25 * max(0.0, azimuth)
+		right_gain = 1.0 + 0.25 * min(0.0, azimuth)
+		left = left * left_gain
+		right = right * right_gain
 
 		stereo = torch.stack([left, right], dim=1).cpu().numpy()
+		return stereo
+
+# Fallback numpy processor (existing simple pan)
+class NumpyBinauralProcessor:
+	def __init__(self, max_delay_ms=2.0, rate=44100):
+		self.rate = rate
+		self.max_delay = int(rate * max_delay_ms / 1000)
+
+	def process(self, mono_np: np.ndarray, azimuth: float = 0.0) -> np.ndarray:
+		# mono -> stereo using integer delay + IID
+		L = mono_np.shape[0]
+		delay = int(azimuth * self.max_delay)
+		if delay > 0:
+			left = mono_np
+			right = np.concatenate((np.zeros(delay, dtype=np.float32), mono_np[:-delay]))
+		elif delay < 0:
+			d = -delay
+			left = np.concatenate((np.zeros(d, dtype=np.float32), mono_np[:-d]))
+			right = mono_np
+		else:
+			left = mono_np
+			right = mono_np
+		left_gain = 1.0 - 0.25 * max(0.0, azimuth)
+		right_gain = 1.0 + 0.25 * min(0.0, azimuth)
+		stereo = np.stack([left * left_gain, right * right_gain], axis=1)
 		return stereo
 
 # 3Dパンニング関数（左右・前後・上下の簡易処理）
@@ -97,8 +148,19 @@ def open_streams():
 
 def run():
 	p, input_stream, output_stream, in_ch, out_ch = open_streams()
-	use_torch = True
-	binaural = BinauralProcessor(rate=RATE)
+	if TORCH_AVAILABLE:
+		try:
+			binaural = AdvancedBinauralProcessor(rate=RATE)
+			use_torch = True
+		except Exception as e:
+			print('PyTorch available but failed to initialize AdvancedBinauralProcessor:', e)
+			binaural = NumpyBinauralProcessor(rate=RATE)
+			use_torch = False
+	else:
+		binaural = NumpyBinauralProcessor(rate=RATE)
+		use_torch = False
+
+	print('Binaural processor:', 'PyTorch' if use_torch else 'NumPy fallback')
 
 	print("リアルタイム3D立体音響システム 起動中... Ctrl+Cで終了")
 	try:
@@ -125,13 +187,10 @@ def run():
 
 			# If output is stereo, apply processing
 			if out_ch == 2:
-				if use_torch:
-					# Convert to mono numpy for ITD processing
-					mono = audio.mean(axis=1)
-					stereo = binaural.apply_itd(mono, azimuth=0.5)
-					audio = stereo
-				else:
-					audio = pan_audio(audio, azimuth=0.5)
+				# Convert to mono numpy for binaural processing
+				mono = audio.mean(axis=1)
+				stereo = binaural.process(mono, azimuth=0.5)
+				audio = stereo
 
 			output_stream.write(audio.astype(np.float32).tobytes())
 	except KeyboardInterrupt:
