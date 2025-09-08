@@ -90,6 +90,106 @@ class NumpyBinauralProcessor:
 		stereo = np.stack([left * left_gain, right * right_gain], axis=1)
 		return stereo
 
+
+class HRTFProcessor:
+	"""Simple streaming HRTF processor.
+	- Can load HRIRs from a dict or .npz file (keys: angles or indices)
+	- If none provided, generates synthetic short HRIRs using ITD+IID approximations
+	- Uses overlap-add for streaming convolution
+	"""
+	def __init__(self, rate=44100, hrir_dict=None, max_delay_ms=2.0):
+		self.rate = rate
+		self.max_delay = int(rate * max_delay_ms / 1000)
+		self.hrir_dict = hrir_dict or {}
+		self.hrirs = None
+		if self.hrir_dict:
+			# expect {angle: (hL, hR)}
+			self.hrirs = sorted([(float(a), np.asarray(v[0], dtype=np.float32), np.asarray(v[1], dtype=np.float32)) for a, v in self.hrir_dict.items()], key=lambda x: x[0])
+		# overlap buffers for left/right
+		self.overlap_l = np.zeros(0, dtype=np.float32)
+		self.overlap_r = np.zeros(0, dtype=np.float32)
+
+	def load_npz(self, path):
+		data = np.load(path, allow_pickle=True)
+		# Expect keys like 'angle_0', or a dict saved; try a couple formats
+		hrir_dict = {}
+		if 'hrir' in data:
+			# user saved structured array
+			hrir = data['hrir']
+			# not handling this case generically
+		else:
+			for k in data.files:
+				# try parse 'angle_XX'
+				if k.startswith('angle_'):
+					ang = float(k.split('_', 1)[1])
+					v = data[k]
+					if v.shape[1] >= 2:
+						hrir_dict[ang] = (v[:,0], v[:,1])
+		if hrir_dict:
+			self.__init__(rate=self.rate, hrir_dict=hrir_dict, max_delay_ms=self.max_delay*1000/self.rate)
+
+	def _synth_hrir(self, azimuth: float, length=128):
+		# create synthetic HRIRs: delta plus small smoothing + delay
+		t = np.arange(length)
+		# simple exponential decay as simple lowpass behavior
+		env = np.exp(-t / (length/8.0)).astype(np.float32)
+		# ITD: map azimuth to sample delay
+		delay = int(np.round(azimuth * self.max_delay))
+		hL = np.zeros(length, dtype=np.float32)
+		hR = np.zeros(length, dtype=np.float32)
+		if delay >= 0:
+			hL[0] = 1.0
+			idx = min(length-1, delay)
+			hR[idx] = 1.0
+		else:
+			d = -delay
+			idx = min(length-1, d)
+			hL[idx] = 1.0
+			hR[0] = 1.0
+		# apply head-shadow envelope (simple)
+		hL *= env * (1.0 - 0.2 * max(0.0, azimuth))
+		hR *= env * (1.0 + 0.2 * min(0.0, azimuth))
+		return hL, hR
+
+	def _select_hrir(self, azimuth: float):
+		if self.hrirs is None:
+			return self._synth_hrir(azimuth)
+		# find nearest angle
+		angles = [a for a,_,_ in self.hrirs]
+		idx = int(np.argmin([abs(azimuth - a) for a in angles]))
+		return self.hrirs[idx][1], self.hrirs[idx][2]
+
+	def process(self, mono_np: np.ndarray, azimuth: float = 0.0) -> np.ndarray:
+		# perform streaming convolution of mono_np with HRIRs
+		mono = mono_np.astype(np.float32)
+		hL, hR = self._select_hrir(azimuth)
+		# time-domain conv
+		out_l = np.convolve(mono, hL)
+		out_r = np.convolve(mono, hR)
+		# add previous overlap
+		if self.overlap_l.size > 0:
+			out_l[:self.overlap_l.size] += self.overlap_l
+		if self.overlap_r.size > 0:
+			out_r[:self.overlap_r.size] += self.overlap_r
+		# split current chunk sized output; keep tail as overlap
+		chunk = mono.shape[0]
+		out_len = out_l.shape[0]
+		if out_len <= chunk:
+			# pad
+			out_l = np.pad(out_l, (0, chunk - out_len), mode='constant')
+			out_r = np.pad(out_r, (0, chunk - out_len), mode='constant')
+			self.overlap_l = np.zeros(0, dtype=np.float32)
+			self.overlap_r = np.zeros(0, dtype=np.float32)
+			stereo = np.stack([out_l, out_r], axis=1)
+			return stereo
+		# take first chunk as output and store remainder
+		out_chunk_l = out_l[:chunk].astype(np.float32)
+		out_chunk_r = out_r[:chunk].astype(np.float32)
+		self.overlap_l = out_l[chunk:].astype(np.float32)
+		self.overlap_r = out_r[chunk:].astype(np.float32)
+		stereo = np.stack([out_chunk_l, out_chunk_r], axis=1)
+		return stereo
+
 # 3Dパンニング関数（左右・前後・上下の簡易処理）
 def pan_audio(data, azimuth=0.0, elevation=0.0):
 	# data: np.ndarray, shape=(n, 2) stereo
@@ -168,6 +268,7 @@ def run():
 	import threading
 	azimuth_lock = threading.Lock()
 	target_azimuth = {'val': 0.0}
+	use_hrtf = {'val': False}
 
 	def control_thread():
 		print("操作: '<' で左、'>' で右、'q'で終了 (Enter不要)")
@@ -183,6 +284,9 @@ def run():
 						target_azimuth['val'] = min(1.0, target_azimuth['val'] + 0.1)
 					elif ch.lower() == 'q':
 						raise KeyboardInterrupt()
+					elif ch.lower() == 'h':
+						use_hrtf['val'] = not use_hrtf['val']
+						print('HRTF', 'ON' if use_hrtf['val'] else 'OFF')
 				print(f"target azimuth={target_azimuth['val']:+.2f}")
 		except KeyboardInterrupt:
 			return
@@ -209,6 +313,9 @@ def run():
 								target_azimuth['val'] = min(1.0, target_azimuth['val'] + 0.1)
 							elif ch.lower() == 'q':
 								raise KeyboardInterrupt()
+							elif ch.lower() == 'h':
+								use_hrtf['val'] = not use_hrtf['val']
+								print('HRTF', 'ON' if use_hrtf['val'] else 'OFF')
 						print(f"target azimuth={target_azimuth['val']:+.2f}")
 					else:
 						time.sleep(0.01)
@@ -252,7 +359,13 @@ def run():
 				current_az = (1.0 - smoothing_alpha) * current_az + smoothing_alpha * tgt
 				# Convert to mono numpy for binaural processing
 				mono = audio.mean(axis=1)
-				stereo = binaural.process(mono, azimuth=current_az)
+				if use_hrtf['val']:
+					# lazy init HRTF processor
+					if not hasattr(run, '_hrtf'):
+						run._hrtf = HRTFProcessor(rate=RATE)
+					stereo = run._hrtf.process(mono, azimuth=current_az)
+				else:
+					stereo = binaural.process(mono, azimuth=current_az)
 				audio = stereo
 
 			output_stream.write(audio.astype(np.float32).tobytes())
