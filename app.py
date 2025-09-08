@@ -163,6 +163,65 @@ def run():
 	print('Binaural processor:', 'PyTorch' if use_torch else 'NumPy fallback')
 
 	print("リアルタイム3D立体音響システム 起動中... Ctrl+Cで終了")
+
+	# Interactive azimuth control (thread-safe)
+	import threading
+	azimuth_lock = threading.Lock()
+	target_azimuth = {'val': 0.0}
+
+	def control_thread():
+		print("操作: '<' で左、'>' で右、'q'で終了 (Enter不要)")
+		try:
+			while True:
+				ch = sys.stdin.read(1)
+				if not ch:
+					break
+				with azimuth_lock:
+					if ch == '<':
+						target_azimuth['val'] = max(-1.0, target_azimuth['val'] - 0.1)
+					elif ch == '>':
+						target_azimuth['val'] = min(1.0, target_azimuth['val'] + 0.1)
+					elif ch.lower() == 'q':
+						raise KeyboardInterrupt()
+				print(f"target azimuth={target_azimuth['val']:+.2f}")
+		except KeyboardInterrupt:
+			return
+
+	ctrl = threading.Thread(target=control_thread, daemon=True)
+	try:
+		# attempt to set stdin to raw mode on POSIX; on Windows PowerShell this will still work with read(1)
+		import msvcrt
+		have_msvcrt = True
+	except Exception:
+		have_msvcrt = False
+
+	if have_msvcrt:
+		# On Windows, spawn a small helper that reads keys without blocking the audio loop
+		def win_ctrl():
+			try:
+				while True:
+					if msvcrt.kbhit():
+						ch = msvcrt.getwch()
+						with azimuth_lock:
+							if ch == '<':
+								target_azimuth['val'] = max(-1.0, target_azimuth['val'] - 0.1)
+							elif ch == '>':
+								target_azimuth['val'] = min(1.0, target_azimuth['val'] + 0.1)
+							elif ch.lower() == 'q':
+								raise KeyboardInterrupt()
+						print(f"target azimuth={target_azimuth['val']:+.2f}")
+					else:
+						time.sleep(0.01)
+			except KeyboardInterrupt:
+				return
+
+		ctrl = threading.Thread(target=win_ctrl, daemon=True)
+
+	ctrl.start()
+
+	# smoothing state
+	current_az = 0.0
+	smoothing_alpha = 0.2
 	try:
 		while True:
 			in_data = input_stream.read(CHUNK, exception_on_overflow=False)
@@ -187,9 +246,13 @@ def run():
 
 			# If output is stereo, apply processing
 			if out_ch == 2:
+				# update smoothed azimuth toward target
+				with azimuth_lock:
+					tgt = target_azimuth['val']
+				current_az = (1.0 - smoothing_alpha) * current_az + smoothing_alpha * tgt
 				# Convert to mono numpy for binaural processing
 				mono = audio.mean(axis=1)
-				stereo = binaural.process(mono, azimuth=0.5)
+				stereo = binaural.process(mono, azimuth=current_az)
 				audio = stereo
 
 			output_stream.write(audio.astype(np.float32).tobytes())
